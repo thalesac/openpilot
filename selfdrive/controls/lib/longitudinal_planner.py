@@ -25,8 +25,39 @@ MIN_ALLOW_THROTTLE_SPEED = 2.5
 _A_TOTAL_MAX_V = [1.7, 3.2]
 _A_TOTAL_MAX_BP = [20., 40.]
 
+# Vision Turn Controller (VTC) — slow down for upcoming curves
+VTC_A_LAT_MAX = 2.5          # max lateral accel in turns (m/s², lower = slower through turns)
+VTC_LOOKAHEAD_MAX_S = 4.0    # how far ahead to look for curves (seconds)
+VTC_MIN_SPEED = 5.0          # minimum turn speed (m/s, ~18 kph) to avoid stopping
+VTC_CURV_THRESHOLD = 0.002   # ignore curvature below this (essentially straight road)
+
 def get_max_accel(v_ego):
   return np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS)
+
+def get_turn_speed_limit(model_msg, v_ego):
+  """Compute max speed for upcoming curves using model's predicted yaw rate."""
+  if len(model_msg.orientationRate.z) != ModelConstants.IDX_N or v_ego < 1.0:
+    return V_CRUISE_MAX * CV.KPH_TO_MS
+
+  yaw_rates = np.abs(model_msg.orientationRate.z)
+  t_idxs = ModelConstants.T_IDXS
+
+  # Find max curvature in the lookahead window (0 to VTC_LOOKAHEAD_MAX_S)
+  max_curv = 0.0
+  for i, t in enumerate(t_idxs):
+    if t > VTC_LOOKAHEAD_MAX_S:
+      break
+    # curvature = yaw_rate / speed (use current v_ego as approximation)
+    curv = yaw_rates[i] / max(v_ego, 1.0)
+    if curv > max_curv:
+      max_curv = curv
+
+  if max_curv < VTC_CURV_THRESHOLD:
+    return V_CRUISE_MAX * CV.KPH_TO_MS
+
+  # v_max = sqrt(a_lat_max / curvature)
+  v_turn = math.sqrt(VTC_A_LAT_MAX / max_curv)
+  return max(v_turn, VTC_MIN_SPEED)
 
 def get_coast_accel(pitch):
   return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
@@ -62,6 +93,7 @@ class LongitudinalPlanner:
     self.v_desired_trajectory = np.zeros(CONTROL_N)
     self.a_desired_trajectory = np.zeros(CONTROL_N)
     self.j_desired_trajectory = np.zeros(CONTROL_N)
+    self.v_turn_filter = FirstOrderFilter(V_CRUISE_MAX * CV.KPH_TO_MS, 0.5, self.dt)
 
   @staticmethod
   def parse_model(model_msg):
@@ -127,6 +159,15 @@ class LongitudinalPlanner:
 
     if force_slow_decel:
       v_cruise = 0.0
+
+    # Vision Turn Controller: limit cruise speed for upcoming curves
+    v_turn_raw = get_turn_speed_limit(sm['modelV2'], v_ego)
+    # Smooth going up (exiting turn) but respond quickly going down (entering turn)
+    if v_turn_raw < self.v_turn_filter.x:
+      self.v_turn_filter.x = v_turn_raw  # instant drop for safety
+    else:
+      self.v_turn_filter.update(v_turn_raw)  # smooth ramp-up on exit
+    v_cruise = min(v_cruise, self.v_turn_filter.x)
 
     self.mpc.set_weights(prev_accel_constraint, personality=sm['selfdriveState'].personality)
     self.mpc.set_cur_state(self.v_desired_filter.x, self.a_desired)
