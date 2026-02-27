@@ -144,7 +144,7 @@ class CarSpecificEvents:
       events.add(EventName.vehicleSensorsInvalid)
     if CS.invalidLkasSetting:
       events.add(EventName.invalidLkasSetting)
-    if CS.lowSpeedAlert:
+    if CS.lowSpeedAlert and self.CP.brand != 'honda':
       events.add(EventName.belowSteerSpeed)
     if CS.buttonEnable:
       events.add(EventName.buttonEnable)
